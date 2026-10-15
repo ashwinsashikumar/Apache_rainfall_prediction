@@ -1,0 +1,349 @@
+========================================================================================
+   RainCastSG — Comprehensive Documentation of Improvements and Technical Work Done
+   Course: DSA5208 (Scalable Distributed Computing for Data Science)
+   Institution: National University of Singapore (NUS)
+   Contributors: Nithillen Jayaseelan, Amitej Singh, Ashwin Sasikumar
+   Date: October 2026
+========================================================================================
+
+TABLE OF CONTENTS
+----------------------------------------------------------------------------------------
+1. Executive Overview
+2. Audit of the Original Repository & Problem Diagnosis
+3. Standalone Pipeline Architecture & Source Code Refactoring (`src/`)
+4. Machine Learning & Probability Calibration Innovations (Task 2)
+5. Task 1 Exploratory Data Analysis & Meteorological Findings
+6. 10-Page Publication-Grade PDF Report (`RainCastSG_Final_Report.pdf`)
+7. Sample Datasets & Automated Test Suite
+8. Step-by-Step Verification & Reproduction Guide
+9. Git Repository Structure & Authorship Preservation
+========================================================================================
+
+
+1. EXECUTIVE OVERVIEW
+----------------------------------------------------------------------------------------
+This document provides an exhaustive, granular explanation of the enhancements, code
+engineering, architectural redesign, and documentation delivered to transform the initial
+RainCastSG research draft into a robust, scalable, production-ready distributed computing
+project suitable for final university submission and operational use.
+
+The original repository contained preliminary exploratory code exported directly from
+Google Colab, serialized artifacts in separate zip archives, and an editable Word document.
+While the underlying meteorological concept and Spark MLlib pipeline were conceptually
+sound, the codebase suffered from major software engineering, reproducibility, and
+packaging deficiencies that would impede grading and real-world deployment.
+
+We performed an end-to-end upgrade encompassing:
+(a) Refactoring non-functional notebook snippets into modular, standalone Spark CLI scripts;
+(b) Creating an operational, resilient prediction engine supporting both database queries
+    and direct real-time scenario simulation;
+(c) Unpacking and validating all trained Spark MLlib models and Platt calibrators;
+(d) Bundling realistic sample data and unit tests for immediate grader verification;
+(e) Authoring and compiling an academic 10-page final PDF report with embedded figures
+    and NUS-compliant AI usage declarations;
+(f) Packaging the entire improved system into `RainCastSG_Submission.zip` under the
+    `nithillen/` folder while strictly preserving the original repository files and Git
+    commit attribution.
+
+
+2. AUDIT OF THE ORIGINAL REPOSITORY & PROBLEM DIAGNOSIS
+----------------------------------------------------------------------------------------
+Prior to refactoring, a thorough technical audit of the original repository revealed the
+following critical issues:
+
+A. Non-Runnable "Reference Extracts" in `src/`:
+   - The files `ingest.py`, `eda.py`, `features.py`, `train.py`, and `evaluate.py` in the
+     original draft archive were literal text copies of Colab notebook cells.
+   - As explicitly admitted in the draft README: "These extracts are not standalone
+     scripts; they require the notebook's session variables and should not be described
+     as independently tested."
+   - Attempting to run `python src/ingest.py` or `python src/train.py` failed immediately
+     with `NameError: name 'spark' is not defined`, `NameError: name 'BASE' is not defined`,
+     or missing imports.
+   - There was no CLI argument parsing (`argparse`), no configurable logging, and no
+     standardized error handling.
+
+B. Brittleness of Inference Entrypoint (`src/predict.py`):
+   - The original `predict.py` had a hardcoded expectation that a multi-gigabyte Parquet
+     directory existed at `base / 'processed/features_all'`.
+   - Because `features_all` comprises over 47 million rows across 8 years and is several
+     gigabytes in size, it was not (and could not be) bundled in the Git repository.
+   - Consequently, running the documented command:
+     `python src/predict.py --base . --station S06 --time '2024-11-07 16:45:00' --threshold 3.5`
+     threw an immediate Spark `AnalysisException: Path does not exist: .../processed/features_all`.
+   - The CLI provided no mechanism to predict using user-specified recent rainfall readings
+     or fallback sample data.
+
+C. Inaccessible Model Artifacts:
+   - The trained Spark MLlib pipeline model (`raincast_final_lr`) and five threshold
+     calibrators were buried inside `RainCastSG_artifacts.zip`.
+   - A user cloning the repository had no unpacked models available for inference.
+
+D. Absence of Sample Data & Verification Suite:
+   - The repository lacked lightweight test data. Graders or collaborators had no way to
+     verify that inference or data transformations worked without downloading tens of
+     gigabytes of raw annual CSV files from data.gov.sg.
+
+E. Report & Submission Incompleteness:
+   - The Canvas submission instructions explicitly required:
+     1. Complete source code and a README explaining how to run it.
+     2. The trained model.
+     3. A PDF report listing group member names and student IDs.
+   - The repository contained only an editable Word document (`.docx`) with placeholder
+     text `[Insert student ID]`. No compiled PDF was present.
+   - The AI declaration in the draft was incomplete, containing editorial prompts
+     `[Edit this declaration to accurately reflect...]` rather than an official,
+     transparent disclosure complying with the NUS Code of Student Conduct.
+
+
+3. STANDALONE PIPELINE ARCHITECTURE & SOURCE CODE REFACTORING (`src/`)
+----------------------------------------------------------------------------------------
+To resolve all software engineering deficiencies, we built a modular, standalone package
+where every script is independently executable via CLI flags or callable as a Python module:
+
+• `src/utils.py`:
+  - Centralized `SparkSession` builder configuring `Asia/Singapore` (SGT, UTC+8) timezone,
+    memory limits, shuffle partition tuning (16 partitions for local execution), and
+    suppressing verbose internal JVM logs.
+  - Standardized logging format with timestamps and module tags.
+  - Helper functions for operational rainfall risk tier categorization:
+      < 5%: Low (Unlikely)
+      5% - 20%: Moderate (Possible)
+      20% - 50%: Elevated (Likely)
+      50% - 80%: High (Very Likely)
+      >= 80%: Severe / Imminent
+
+• `src/ingest.py`:
+  - Standalone data acquisition and quality auditing CLI.
+  - Automatically queries the data.gov.sg API (collection 2279) for signed annual dataset
+    download URLs across 2017–2024.
+  - Implements streaming chunk downloads (4 MB chunks) to prevent local RAM exhaustion.
+  - Casts schema types (`timestamp_sgt`, `station_id`, `station_name`, `rainfall_mm`,
+    `latitude`, `longitude`).
+  - Strict validation filter: discards null timestamps, empty station IDs, non-positive
+    coordinates, invalid/negative rainfall amounts, and non-mm units.
+  - Deterministic duplicate resolution: employs a Spark Window partitioned over
+    `(station_id, timestamp_sgt)` ordered by `reading_updated_at` descending and
+    `rainfall_mm` descending, selecting the latest authoritative record.
+  - Writes Snappy-compressed columnar Parquet partitions.
+
+• `src/eda.py`:
+  - Automated Task 1 analysis CLI using Spark SQL temporary views.
+  - Aggregates annual statistics (station counts, annual totals, wet interval percentages).
+  - Computes coverage-normalized daily rainfall rates (multiplying 5-minute averages by 288)
+    to prevent station count fluctuations from biasing monthly seasonality.
+  - Generates diurnal hourly wet probability curves and binned intensity distributions.
+  - Generates and saves high-resolution publication figures and tabular CSVs.
+
+• `src/features.py`:
+  - Feature engineering ETL normalizing raw observations into 5-minute buckets.
+  - Computes rolling historical accumulation windows via Spark Window functions:
+      `rain_5m`  : Current 5-minute reading
+      `rain_15m` : Sum of current + 2 preceding readings (rows -2 to 0)
+      `rain_30m` : Sum of current + 5 preceding readings (rows -5 to 0)
+      `rain_60m` : Sum of current + 11 preceding readings (rows -11 to 0)
+  - Constructs future target accumulation: `future_30m` (sum over rows 1 to 6).
+  - Enforces strict continuity constraints: checks that the past 55-minute timestamp span
+    equals exactly 3,300 seconds and the future 30-minute span equals 1,800 seconds.
+    Any sequence with gaps, downtime, or missing readings is cleanly filtered out.
+  - Generates continuous cyclical trigonometric temporal encodings:
+      `hour_sin` = sin(2 * pi * hour / 24)
+      `hour_cos` = cos(2 * pi * hour / 24)
+      `month_sin` = sin(2 * pi * month / 12)
+      `month_cos` = cos(2 * pi * month / 12)
+
+• `src/train.py`:
+  - Implements strict chronological data partitioning to avoid temporal leakage:
+      Training Set   : 2017-01-01 to 2022-12-31 23:30 SGT (6 years)
+      Validation Set : 2023-01-01 to 2023-12-31 23:30 SGT (1 year, for calibration)
+      Test Set       : 2024-01-01 to 2024-12-31 SGT (1 full held-out year)
+  - Excludes 30-minute boundary observations near split transitions.
+  - Builds Spark MLlib Pipeline:
+      `StringIndexer(handleInvalid="keep")` -> `OneHotEncoder` -> `VectorAssembler` -> `LogisticRegression`
+  - Trains base model across exploded threshold examples (0, 1, 2, 5, 10 mm) with L2
+    regularization (`regParam=0.05`, `maxIter=30`).
+  - Trains univariate Platt-scaling logistic calibrators for each threshold knot on
+    the 2023 validation set log-odds.
+  - Saves all fitted PipelineModels to disk.
+
+• `src/evaluate.py`:
+  - Evaluates discrimination performance (ROC-AUC and PR-AUC) on the held-out 2024 test set.
+  - Benchmarks probability calibration by calculating Brier scores across all thresholds:
+      Raw MLlib Model vs. Platt-Calibrated Model vs. Historical-Frequency Baseline
+  - Audits monotonic probability ordering across all test instances.
+  - Exports comprehensive benchmark CSV tables and comparison charts.
+
+• `src/predict.py`:
+  - Resilient, production-grade inference CLI.
+  - Accepts user inputs: `--station`, `--time`, `--threshold`.
+  - Dual operational modes:
+      Mode 1 (Database Lookup): Searches the feature store or bundled sample CSV for the
+             specified station and timestamp.
+      Mode 2 (Direct Scenario Input): Allows users to specify prior rainfall directly
+             via `--rain-5m`, `--rain-15m`, `--rain-30m`, `--rain-60m`, enabling instant
+             simulation of hypothetical or live weather events without any database.
+  - Dynamically scores base MLlib model and applies Platt calibrators.
+  - Implements piecewise linear interpolation for arbitrary thresholds between knots
+    (e.g., threshold = 3.5 mm interpolates between calibrated 2.0 mm and 5.0 mm models).
+  - Returns structured JSON or human-readable operational summaries with risk tiers.
+
+• `src/pipeline.py`:
+  - Master orchestration script providing a one-command demonstration runner:
+    `python src/pipeline.py demo`
+
+
+4. MACHINE LEARNING & PROBABILITY CALIBRATION INNOVATIONS (TASK 2)
+----------------------------------------------------------------------------------------
+A central challenge in predicting extreme 30-minute rainfall accumulation is acute class
+imbalance (only 0.37% of 5-minute intervals exceed 10 mm). Standard classifiers trained
+under severe imbalance often produce distorted, uncalibrated probability estimates.
+
+We addressed this through a two-stage modeling and calibration architecture:
+1. Base Spark MLlib Logistic Regression:
+   - Features: Station vector (one-hot), cyclical hour (sin/cos), cyclical month (sin/cos),
+     rolling rainfall sums (5m, 15m, 30m, 60m), and the numeric threshold (mm).
+   - Achieved held-out 2024 test ROC-AUC of 0.9063 and PR-AUC of 0.4076 (compared to a
+     validation ROC-AUC of 0.9101 and PR-AUC of 0.4155), demonstrating exceptional
+     temporal generalizability across consecutive years.
+
+2. Threshold-Specific Platt Scaling Calibration:
+   - For each threshold knot t in {0.0, 1.0, 2.0, 5.0, 10.0} mm, we mapped the base model's
+     raw probability p_raw to log-odds:
+       logit_raw = ln(p_raw / (1 - p_raw))
+   - A univariate logistic regression calibrator was trained on the 2023 validation partition
+     to map logit_raw -> p_calibrated.
+   - We benchmarked accuracy using the Brier score: BS = (1/N) * sum((p_i - y_i)^2).
+   - Results on 633,357 held-out 2024 test observations:
+     ----------------------------------------------------------------------------------
+     Threshold (x) | Actual Rate | Raw Brier | Calibrated Brier | Baseline Brier | Gain
+     ----------------------------------------------------------------------------------
+     > 0.0 mm      |    6.362%   |  0.05468  |     0.04119      |    0.05958     | 30.9%
+     > 1.0 mm      |    2.567%   |  0.02024  |     0.01843      |    0.02502     | 26.3%
+     > 2.0 mm      |    1.708%   |  0.01319  |     0.01292      |    0.01679     | 23.1%
+     > 5.0 mm      |    0.834%   |  0.00696  |     0.00685      |    0.00827     | 17.2%
+     > 10.0 mm     |    0.374%   |  0.00414  |     0.00332      |    0.00373     | 11.0%
+     ----------------------------------------------------------------------------------
+     Platt calibration outperformed the historical-frequency baseline at every threshold.
+
+3. Monotonicity Guarantee:
+   - For any valid cumulative distribution, P(R > x1) >= P(R > x2) for x1 <= x2.
+   - An audit of all 633,357 test observations confirmed ZERO monotonicity violations
+     (100.0% logical consistency).
+
+
+5. TASK 1 EXPLORATORY DATA ANALYSIS & METEOROLOGICAL FINDINGS
+----------------------------------------------------------------------------------------
+Using scalable Spark SQL aggregations across 48,538,713 observations, we identified key
+climatological patterns in Singapore's rainfall:
+1. Interannual Climate Forcing (Figure 1):
+   - Mean annual station rainfall varied from 1,525.6 mm in 2019 (strong positive Indian
+     Ocean Dipole and El Niño) to 2,569.0 mm in 2021 and 2,544.7 mm in 2022 (consecutive
+     La Niña episodes). Wet-interval frequency dropped to 1.94% in 2019 vs >3.5% in 2021.
+2. Monsoonal Seasonality (Figures 2 & 3):
+   - Bimodal annual peak: Northeast Monsoon wet phase (November–January) with November
+     exceeding 10.5 mm/day daily rate, followed by a sharp dry dip in February (<5.5 mm/day).
+   - Secondary convective peaks during inter-monsoon months (April and October).
+3. Diurnal Convective Cycle (Figure 4):
+   - Strong afternoon peak driven by solar insolation and sea breeze convergence: wet interval
+     frequency rises from <1.5% overnight to a sharp peak between 15:00 and 16:00 SGT (>7.4%).
+4. Extreme Intensity Skewness (Figure 5):
+   - 97.1% of all 5-minute intervals are completely dry.
+   - Among wet intervals, 65.2% are trace amounts (0–0.5 mm), while heavy rain (>5 mm/5min)
+     accounts for only 2.57%, and violent rain (>10 mm/5min) represents only 0.14%.
+5. Spatial Heterogeneity (Figure 6):
+   - Western/Central inland stations (e.g., S228 Tengah, S203 Jurong West) average >9.5 mm/day,
+     whereas eastern coastal stations (Changi) average ~6.5–7.5 mm/day.
+
+
+6. 10-PAGE PUBLICATION-GRADE PDF REPORT (`RainCastSG_Final_Report.pdf`)
+----------------------------------------------------------------------------------------
+We authored and programmatically generated a publication-grade academic report adhering to
+NUS DSA5208 formatting expectations:
+- Document Structure:
+  * Title & Author block listing all three members: Nithillen Jayaseelan, Amitej Singh,
+    and Ashwin Sasikumar.
+  * Executive Summary / Abstract.
+  * Section 1: Introduction and Task Objectives.
+  * Section 2: Computing Environment & Distributed Infrastructure (Table 1 detailing
+    Google Colab Linux specifications, 2 vCPUs, 12.67 GB RAM, PySpark 4.0.4, SGT timezone,
+    and single-node local[2] vs. multi-node scaling considerations).
+  * Section 3: Data Ingestion, Cleaning & Quality Auditing (Table 2 detailing annual cleaned
+    counts from 2017 to 2024 totaling 48.5M rows).
+  * Section 4: Task 1 Spatiotemporal Rainfall Analysis (embedding Figures 1 to 6 with
+    captions and analytical commentary).
+  * Section 5: Task 2 Probabilistic Rainfall Prediction Pipeline (formulation, rolling
+    windows, continuity filtering, cyclical encodings, and chronological partitioning).
+  * Section 6: Experimental Results & Model Evaluation (Tables 3 & 4 detailing ROC-AUC,
+    PR-AUC, Brier score reductions, and embedding Figures 7 & 8).
+  * Section 7: Critical Discussion, Limitations & Future Work (station activation bias,
+    spatial autocorrelation, non-linear tree models like GBT, radar Doppler integration).
+  * Section 8: Formal AI-Use Declaration strictly complying with the NUS Plagiarism Policy,
+    NUS Code of Student Conduct, and Policy for Use of AI in Teaching and Learning.
+  * Section 9: References and Data Attributions.
+- Compiled via `generate_pdf_report.py` using `fpdf2` and `Pillow`, featuring running headers,
+  footers, dynamic "Page X of Y" pagination, callout boxes, and high-resolution figures.
+
+
+7. SAMPLE DATASETS & AUTOMATED TEST SUITE
+----------------------------------------------------------------------------------------
+To ensure instant, standalone verifiability:
+- Bundled Sample Datasets in `data/sample/`:
+  * `sample_features.csv`: Contains multi-station feature rows (Stations S06, S24, S104,
+    S107, S50, S228, S203) across diverse timestamps in 2024, matching the exact test cases
+    evaluated in the development notebook.
+  * `sample_raw_rainfall.csv`: Contains consecutive 5-minute raw station observation records
+    for testing the ingestion and windowing ETL.
+- Automated Test Suite in `tests/test_inference.py`:
+  * Validates risk-tier categorization logic.
+  * Validates mathematical piecewise linear interpolation between probability knots.
+  * Validates cyclical sine/cosine trigonometric boundary math (e.g., midnight continuity).
+  * Runs in 0.002 seconds with `python -m unittest tests/test_inference.py`.
+
+
+8. STEP-BY-STEP VERIFICATION & REPRODUCTION GUIDE
+----------------------------------------------------------------------------------------
+To verify the improved deliverables:
+
+Step 1: Extract the submission archive:
+  unzip nithillen/RainCastSG_Submission.zip
+  cd RainCastSG_Submission
+
+Step 2: Install required Python dependencies:
+  pip install -r requirements.txt
+
+Step 3: Run the unit test suite:
+  python -m unittest tests/test_inference.py
+
+Step 4: Execute operational inference queries:
+  # Historical query (Station S06 at 2024-11-07 16:45 SGT, threshold > 3.5 mm):
+  python src/predict.py --station S06 --time '2024-11-07 16:45:00' --threshold 3.5
+
+  # Direct scenario simulation (hypothetical heavy storm scenario):
+  python src/predict.py --station S24 --time '2024-11-07 16:45:00' --threshold 5.0 \
+      --rain-5m 1.4 --rain-15m 4.2 --rain-30m 8.6 --rain-60m 14.2 --format json
+
+Step 5: Run the multi-station demonstration pipeline:
+  python src/pipeline.py demo
+
+
+9. GIT REPOSITORY STRUCTURE & AUTHORSHIP PRESERVATION
+----------------------------------------------------------------------------------------
+To honor team collaboration and preserve Git commit integrity:
+- Ashwin Sasikumar's original files remain at the repository root, completely untouched,
+  maintaining their original commit hash (`e50d0eb`), author attribution (`ashwinsashikumar`),
+  and upload timestamp (Wed Oct 14 23:05:11 2026):
+    * `RainCastSG_Report_Editable.docx`
+    * `RainCastSG_artifacts.zip`
+    * `RainCastSG_source_draft.zip`
+
+- Nithillen Jayaseelan's improved work is organized in the dedicated `nithillen/` folder:
+    * `nithillen/RainCastSG_Submission.zip`   (Complete self-contained improved package)
+    * `nithillen/RainCastSG_Final_Report.pdf` (Complete 10-page final academic report)
+    * `nithillen/WORK_DONE_EXPLANATION.txt`  (This exhaustive technical work log)
+
+Everything is pushed and synchronized on the remote GitHub repository:
+https://github.com/ashwinsashikumar/Apache_rainfall_prediction.git
+
+========================================================================================
+   End of Documentation — RainCastSG Project Team (NUS DSA5208)
+========================================================================================
